@@ -1,8 +1,6 @@
 // EON 3D Objects API Service
 // Integrates with fal.ai Hunyuan3D and AIML API for mesh segmentation
-
-const FAL_API_BASE = 'https://fal.run'
-const AIML_API_BASE = 'https://api.aimlapi.com'
+import * as fal from '@fal-ai/client'
 
 // Store API keys (in production, these should come from environment variables)
 let apiKeys = {
@@ -10,11 +8,21 @@ let apiKeys = {
   aiml: localStorage.getItem('AIMLAPI_KEY') || ''
 }
 
-export function setApiKeys(fal, aiml) {
-  apiKeys.fal = fal
+// Configure fal client when keys are set
+function configureFal() {
+  if (apiKeys.fal) {
+    fal.config({
+      credentials: apiKeys.fal
+    })
+  }
+}
+
+export function setApiKeys(falKey, aiml) {
+  apiKeys.fal = falKey
   apiKeys.aiml = aiml
-  localStorage.setItem('FAL_KEY', fal)
+  localStorage.setItem('FAL_KEY', falKey)
   localStorage.setItem('AIMLAPI_KEY', aiml)
+  configureFal()
 }
 
 export function getApiKeys() {
@@ -25,34 +33,29 @@ export function hasValidKeys() {
   return apiKeys.fal && apiKeys.aiml
 }
 
-// Upload image to fal.ai storage for processing
-export async function uploadImage(file) {
-  const formData = new FormData()
-  formData.append('file', file)
+// Initialize fal config on load
+configureFal()
 
-  const response = await fetch('https://fal.run/fal-ai/imageutils/upload', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Key ${apiKeys.fal}`
-    },
-    body: formData
+// Convert File to data URL for fal.ai
+async function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result)
+    reader.onerror = reject
+    reader.readAsDataURL(file)
   })
-
-  if (!response.ok) {
-    throw new Error(`Upload failed: ${response.statusText}`)
-  }
-
-  const data = await response.json()
-  return data.url
 }
 
-// Generate 3D model from images using Hunyuan3D V3
+// Generate 3D model from images using Hunyuan3D V3 via fal.ai client
 export async function generateMesh(imageUrls, options = {}) {
+  configureFal()
+
   const input = {
-    input_image_url: imageUrls.front,
-    face_count: options.faceCount || 500000,
+    image_url: imageUrls.front,
+    foreground_ratio: 0.9,
+    texture_size: 1024,
+    target_face_num: options.faceCount || 500000,
     generate_type: options.type || 'Normal',
-    polygon_type: options.polygonType || 'triangle',
     enable_pbr: options.pbr !== false
   }
 
@@ -61,26 +64,26 @@ export async function generateMesh(imageUrls, options = {}) {
   if (imageUrls.left) input.left_image_url = imageUrls.left
   if (imageUrls.right) input.right_image_url = imageUrls.right
 
-  const response = await fetch(`${FAL_API_BASE}/fal-ai/hunyuan3d-v3/image-to-3d`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Key ${apiKeys.fal}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(input)
-  })
+  try {
+    const result = await fal.subscribe('fal-ai/hunyuan3d-v3/image-to-3d', {
+      input,
+      logs: true,
+      onQueueUpdate: (update) => {
+        if (update.status === 'IN_PROGRESS') {
+          console.log('Generation progress:', update.logs)
+        }
+      }
+    })
 
-  if (!response.ok) {
-    const error = await response.text()
-    throw new Error(`3D generation failed: ${error}`)
-  }
-
-  const result = await response.json()
-  return {
-    glbUrl: result.model_glb?.url || result.model_urls?.glb?.url,
-    objUrl: result.model_urls?.obj?.url,
-    thumbnail: result.thumbnail?.url,
-    fileSize: result.model_glb?.file_size
+    return {
+      glbUrl: result.data?.model_glb?.url || result.data?.model_urls?.glb?.url,
+      objUrl: result.data?.model_urls?.obj?.url,
+      thumbnail: result.data?.thumbnail?.url,
+      fileSize: result.data?.model_glb?.file_size
+    }
+  } catch (error) {
+    console.error('Mesh generation error:', error)
+    throw new Error(`3D generation failed: ${error.message}`)
   }
 }
 
@@ -102,55 +105,58 @@ export async function segmentMesh(meshUrl, options = {}) {
     payload.seed = options.seed
   }
 
-  const response = await fetch(`${AIML_API_BASE}/v1/images/generations`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKeys.aiml}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  })
+  try {
+    const response = await fetch('https://api.aimlapi.com/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKeys.aiml}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    })
 
-  if (!response.ok) {
-    const error = await response.text()
-    throw new Error(`Segmentation failed: ${error}`)
-  }
-
-  const result = await response.json()
-
-  // Parse parts from response
-  const parts = []
-  for (const [key, value] of Object.entries(result)) {
-    if (key.startsWith('mask_') && key.endsWith('_mesh')) {
-      parts.push({
-        id: key.replace('_mesh', ''),
-        name: `Part ${parts.length + 1}`,
-        url: value.url,
-        fileName: value.file_name,
-        fileSize: value.file_size
-      })
+    if (!response.ok) {
+      const error = await response.text()
+      throw new Error(`Segmentation failed: ${error}`)
     }
-  }
 
-  return {
-    segmentedMesh: result.segmented_mesh,
-    parts,
-    partCount: parts.length
+    const result = await response.json()
+
+    // Parse parts from response
+    const parts = []
+    for (const [key, value] of Object.entries(result)) {
+      if (key.startsWith('mask_') && key.endsWith('_mesh')) {
+        parts.push({
+          id: key.replace('_mesh', ''),
+          name: `Part ${parts.length + 1}`,
+          url: value.url,
+          fileName: value.file_name,
+          fileSize: value.file_size
+        })
+      }
+    }
+
+    return {
+      segmentedMesh: result.segmented_mesh,
+      parts,
+      partCount: parts.length
+    }
+  } catch (error) {
+    console.error('Segmentation error:', error)
+    // Return empty parts if segmentation fails - at least we have the mesh
+    return {
+      segmentedMesh: null,
+      parts: [],
+      partCount: 0
+    }
   }
 }
 
 // Full pipeline: Image(s) → 3D Model → Segmented Parts
 export async function runPipeline(assetSpec, onProgress) {
-  const stages = [
-    { id: 'upload', label: 'Uploading Images', progress: 0 },
-    { id: 'mesh', label: 'Generating 3D Mesh', progress: 25 },
-    { id: 'segment', label: 'Segmenting Components', progress: 60 },
-    { id: 'finalize', label: 'Finalizing Asset', progress: 90 }
-  ]
-
   try {
-    // Stage 1: Upload images
-    onProgress?.({ stage: 'upload', progress: 0, message: 'Uploading images...' })
+    // Stage 1: Prepare images
+    onProgress?.({ stage: 'upload', progress: 0, message: 'Preparing images...' })
 
     const imageUrls = {}
     const imageFiles = assetSpec.images
@@ -161,16 +167,16 @@ export async function runPipeline(assetSpec, onProgress) {
           // Already a URL
           imageUrls[view] = file
         } else {
-          // File object - upload it
-          const url = await uploadImage(file)
-          imageUrls[view] = url
+          // File object - convert to data URL for fal.ai
+          const dataUrl = await fileToDataUrl(file)
+          imageUrls[view] = dataUrl
         }
-        onProgress?.({ stage: 'upload', progress: 20, message: `Uploaded ${view} view` })
+        onProgress?.({ stage: 'upload', progress: 20, message: `Prepared ${view} view` })
       }
     }
 
     // Stage 2: Generate 3D mesh
-    onProgress?.({ stage: 'mesh', progress: 25, message: 'Generating 3D mesh with Hunyuan3D...' })
+    onProgress?.({ stage: 'mesh', progress: 25, message: 'Generating 3D mesh with Hunyuan3D... (30-60 seconds)' })
 
     const meshResult = await generateMesh(imageUrls, {
       faceCount: assetSpec.targetTriangles || 500000,
@@ -178,14 +184,23 @@ export async function runPipeline(assetSpec, onProgress) {
       pbr: assetSpec.enablePbr !== false
     })
 
-    onProgress?.({ stage: 'mesh', progress: 55, message: '3D mesh generated successfully' })
+    if (!meshResult.glbUrl) {
+      throw new Error('No 3D model was generated')
+    }
 
-    // Stage 3: Segment into parts
+    onProgress?.({ stage: 'mesh', progress: 55, message: '3D mesh generated successfully!' })
+
+    // Stage 3: Segment into parts (optional - may fail)
     onProgress?.({ stage: 'segment', progress: 60, message: 'Segmenting mesh into components...' })
 
-    const segmentResult = await segmentMesh(meshResult.glbUrl)
-
-    onProgress?.({ stage: 'segment', progress: 85, message: `Detected ${segmentResult.partCount} components` })
+    let segmentResult = { parts: [], partCount: 0 }
+    try {
+      segmentResult = await segmentMesh(meshResult.glbUrl)
+      onProgress?.({ stage: 'segment', progress: 85, message: `Detected ${segmentResult.partCount} components` })
+    } catch (segError) {
+      console.warn('Segmentation failed, continuing without parts:', segError)
+      onProgress?.({ stage: 'segment', progress: 85, message: 'Skipped segmentation (mesh ready)' })
+    }
 
     // Stage 4: Finalize
     onProgress?.({ stage: 'finalize', progress: 90, message: 'Finalizing asset...' })
@@ -219,6 +234,7 @@ export async function runPipeline(assetSpec, onProgress) {
     return asset
 
   } catch (error) {
+    console.error('Pipeline error:', error)
     onProgress?.({ stage: 'error', progress: 0, message: error.message })
     throw error
   }
